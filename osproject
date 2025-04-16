@@ -1,0 +1,411 @@
+
+installations 
+sudo apt-get install libcurl4-openssl-dev
+sudo apt update
+sudo apt install curl
+sudo apt-get install libsqlite3-dev
+
+
+how to run 
+gcc web_scraper.c -o web_scraper -lpthread -lcurl -lsqlite3 -lm
+./web_scraper
+
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <curl/curl.h>
+#include <sqlite3.h>
+#include <math.h> // For sigmoid function
+#include <unistd.h> // For sleep function
+
+// Define constants
+#define NUM_FETCHERS 3
+#define NUM_PROCESSORS 2
+#define BUFFER_SIZE 10
+#define MAX_URL_LENGTH 256
+#define MAX_CONTENT_LENGTH 1024 // Adjust as needed
+
+// Data Structures
+typedef struct {
+    char url[MAX_URL_LENGTH];
+    char content[MAX_CONTENT_LENGTH];
+    double sentiment; // Sentiment score between 0 and 1
+} WebData;
+
+typedef struct {
+    WebData data[BUFFER_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_full;
+    pthread_cond_t not_empty;
+} Buffer;
+
+typedef struct {
+    Buffer *buffer;
+    // Add any other thread-specific data here
+} ThreadArgs;
+
+// Global Variables
+Buffer fetch_process_buffer;
+Buffer process_store_buffer;
+sqlite3 *db;
+
+// Function Prototypes
+void *fetcher_routine(void *arg);
+void *processor_routine(void *arg);
+void *storer_routine(void *arg);
+size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp);
+double analyze_sentiment(const char *text); // AI sentiment analysis
+int init_database();
+int insert_data(const WebData *data);
+void init_buffer(Buffer *buffer);
+void destroy_buffer(Buffer *buffer);
+void cleanup();
+
+// Sentiment Analysis Model (Simplified Logistic Regression)
+// These are just example weights and bias.  You'd train a real model.
+double word_weights[10] = {0.5, -0.3, 0.2, -0.1, 0.4, -0.2, 0.1, -0.4, 0.3, -0.5}; // Weights for 10 example words
+double bias = 0.0;
+
+// Sigmoid function
+double sigmoid(double x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+// Main Function
+int main() {
+    pthread_t fetcher_threads[NUM_FETCHERS];
+    pthread_t processor_threads[NUM_PROCESSORS];
+    pthread_t storer_thread;
+    ThreadArgs fetcher_args[NUM_FETCHERS];
+    ThreadArgs processor_args[NUM_PROCESSORS];
+    ThreadArgs storer_args;
+
+    // Initialize Buffers
+    init_buffer(&fetch_process_buffer);
+    init_buffer(&process_store_buffer);
+
+    // Initialize Database
+    if (init_database() != 0) {
+        fprintf(stderr, "Failed to initialize database.\n");
+        return 1;
+    }
+
+    // Initialize libcurl
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    // Create Fetcher Threads
+    for (int i = 0; i < NUM_FETCHERS; i++) {
+        fetcher_args[i].buffer = &fetch_process_buffer;
+        // Initialize fetcher_args[i] with specific URLs to fetch
+        // Example:
+        snprintf(fetcher_args[i].buffer->data[0].url, MAX_URL_LENGTH, "https://www.example.com/%d", i); // Example URL
+        if (pthread_create(&fetcher_threads[i], NULL, fetcher_routine, &fetcher_args[i]) != 0) {
+            perror("pthread_create (fetcher)");
+            exit(1);
+        }
+    }
+
+    // Create Processor Threads
+    for (int i = 0; i < NUM_PROCESSORS; i++) {
+        processor_args[i].buffer = &process_store_buffer;
+        if (pthread_create(&processor_threads[i], NULL, processor_routine, &processor_args[i]) != 0) {
+            perror("pthread_create (processor)");
+            exit(1);
+        }
+    }
+
+    // Create Storer Thread
+    storer_args.buffer = &process_store_buffer;
+    if (pthread_create(&storer_thread, NULL, storer_routine, &storer_args) != 0) {
+        perror("pthread_create (storer)");
+        exit(1);
+    }
+
+    // Wait for Threads to Finish (Example: Wait for a fixed time, then signal to stop)
+    sleep(10); // Run for 10 seconds
+
+    // Signal threads to stop (Implement a proper signaling mechanism)
+    // For example, set a global flag and check it in the thread routines.
+    // Then signal the condition variables to wake up waiting threads.
+
+    // Join Threads
+    for (int i = 0; i < NUM_FETCHERS; i++) {
+        pthread_join(fetcher_threads[i], NULL);
+    }
+    for (int i = 0; i < NUM_PROCESSORS; i++) {
+        pthread_join(processor_threads[i], NULL);
+    }
+    pthread_join(storer_thread, NULL);
+
+    // Cleanup
+    curl_global_cleanup();
+    sqlite3_close(db);
+    destroy_buffer(&fetch_process_buffer);
+    destroy_buffer(&process_store_buffer);
+
+    return 0;
+}
+
+// Fetcher Thread Routine
+void *fetcher_routine(void *arg) {
+    ThreadArgs *args = (ThreadArgs *)arg;
+    Buffer *buffer = args->buffer;
+    CURL *curl;
+    CURLcode res;
+
+    curl = curl_easy_init();
+    if (curl) {
+        while (1) { // Loop until a stop signal is received
+            // Get URL from somewhere (e.g., a list of URLs, a queue)
+            // For this example, we'll just use the URL provided in the args
+            char url[MAX_URL_LENGTH];
+            strncpy(url, args->buffer->data[0].url, MAX_URL_LENGTH); // Copy the URL
+
+            pthread_mutex_lock(&buffer->mutex);
+            while (buffer->count == BUFFER_SIZE) {
+                pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+            }
+
+            // Fetch data
+            curl_easy_setopt(curl, CURLOPT_URL, url);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer->data[buffer->tail].content);
+
+            res = curl_easy_perform(curl);
+            if (res != CURLE_OK) {
+                fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+                // Handle error (e.g., retry, skip)
+            } else {
+                // Store URL in the data structure
+                strncpy(buffer->data[buffer->tail].url, url, MAX_URL_LENGTH);
+
+                buffer->tail = (buffer->tail + 1) % BUFFER_SIZE;
+                buffer->count++;
+                printf("Fetcher: Fetched %s, Count: %d\n", url, buffer->count);
+            }
+
+            pthread_cond_signal(&buffer->not_empty);
+            pthread_mutex_unlock(&buffer->mutex);
+
+            // Check for stop signal (e.g., a global flag)
+            // if (stop_signal) break;
+
+            sleep(1); // Simulate some work
+        }
+        curl_easy_cleanup(curl);
+    }
+
+    pthread_exit(NULL);
+}
+
+// Processor Thread Routine
+void *processor_routine(void *arg) {
+    ThreadArgs *args = (ThreadArgs *)arg;
+    Buffer *in_buffer = &fetch_process_buffer;
+    Buffer *out_buffer = args->buffer;
+
+    while (1) { // Loop until a stop signal is received
+        pthread_mutex_lock(&in_buffer->mutex);
+        while (in_buffer->count == 0) {
+            pthread_cond_wait(&in_buffer->not_empty, &in_buffer->mutex);
+        }
+
+        WebData data = in_buffer->data[in_buffer->head];
+        in_buffer->head = (in_buffer->head + 1) % BUFFER_SIZE;
+        in_buffer->count--;
+        printf("Processor: Processing %s, Count: %d\n", data.url, in_buffer->count);
+
+        pthread_cond_signal(&in_buffer->not_full);
+        pthread_mutex_unlock(&in_buffer->mutex);
+
+        // Process data (e.g., sentiment analysis)
+        double sentiment = analyze_sentiment(data.content);
+        data.sentiment = sentiment;
+
+        pthread_mutex_lock(&out_buffer->mutex);
+        while (out_buffer->count == BUFFER_SIZE) {
+            pthread_cond_wait(&out_buffer->not_full, &out_buffer->mutex);
+        }
+
+        out_buffer->data[out_buffer->tail] = data;
+        out_buffer->tail = (out_buffer->tail + 1) % BUFFER_SIZE;
+        out_buffer->count++;
+        printf("Processor: Processed %s, Count: %d\n", data.url, out_buffer->count);
+
+        pthread_cond_signal(&out_buffer->not_empty);
+        pthread_mutex_unlock(&out_buffer->mutex);
+
+        // Check for stop signal
+        // if (stop_signal) break;
+
+        sleep(1); // Simulate some work
+    }
+
+    pthread_exit(NULL);
+}
+
+// Storer Thread Routine
+void *storer_routine(void *arg) {
+    ThreadArgs *args = (ThreadArgs *)arg;
+    Buffer *buffer = args->buffer;
+
+    while (1) { // Loop until a stop signal is received
+        pthread_mutex_lock(&buffer->mutex);
+        while (buffer->count == 0) {
+            pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+        }
+
+        WebData data = buffer->data[buffer->head];
+        buffer->head = (buffer->head + 1) % BUFFER_SIZE;
+        buffer->count--;
+        printf("Storer: Storing %s, Count: %d\n", data.url, buffer->count);
+
+        pthread_cond_signal(&buffer->not_full);
+        pthread_mutex_unlock(&buffer->mutex);
+
+        // Store data in database
+        if (insert_data(&data) != 0) {
+            fprintf(stderr, "Failed to insert data for URL: %s\n", data.url);
+        }
+
+        // Check for stop signal
+        // if (stop_signal) break;
+
+        sleep(1); // Simulate some work
+    }
+
+    pthread_exit(NULL);
+}
+
+// Write Callback Function for libcurl
+size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t real_size = size * nmemb;
+    char *data = (char *)userp;
+    strncpy(data, (char *)contents, MAX_CONTENT_LENGTH - 1); // Ensure null termination
+    data[MAX_CONTENT_LENGTH - 1] = '\0';
+    return real_size;
+}
+
+// AI Sentiment Analysis (Simplified Logistic Regression)
+double analyze_sentiment(const char *text) {
+    double weighted_sum = bias;
+    char *token = NULL;
+    char *text_copy = strdup(text); // Duplicate the string for tokenizing
+    if (text_copy == NULL) {
+        perror("strdup");
+        return 0.5; // Return neutral sentiment in case of error
+    }
+
+    token = strtok(text_copy, " \t\n.,;!?"); // Tokenize the text
+
+    while (token != NULL) {
+        // Check if the token matches any of our example words
+        if (strcmp(token, "good") == 0) {
+            weighted_sum += word_weights[0];
+        } else if (strcmp(token, "bad") == 0) {
+            weighted_sum += word_weights[1];
+        } else if (strcmp(token, "excellent") == 0) {
+            weighted_sum += word_weights[2];
+        } else if (strcmp(token, "terrible") == 0) {
+            weighted_sum += word_weights[3];
+        } else if (strcmp(token, "happy") == 0) {
+            weighted_sum += word_weights[4];
+        } else if (strcmp(token, "sad") == 0) {
+            weighted_sum += word_weights[5];
+        } else if (strcmp(token, "amazing") == 0) {
+            weighted_sum += word_weights[6];
+        } else if (strcmp(token, "awful") == 0) {
+            weighted_sum += word_weights[7];
+        } else if (strcmp(token, "positive") == 0) {
+            weighted_sum += word_weights[8];
+        } else if (strcmp(token, "negative") == 0) {
+            weighted_sum += word_weights[9];
+        }
+
+        token = strtok(NULL, " \t\n.,;!?"); // Get the next token
+    }
+
+    free(text_copy); // Free the duplicated string
+
+    // Apply sigmoid function to get a sentiment score between 0 and 1
+    return sigmoid(weighted_sum);
+}
+
+// Initialize Database
+int init_database() {
+    int rc = sqlite3_open("web_data.db", &db);
+    if (rc) {
+        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    const char *sql = "CREATE TABLE IF NOT EXISTS web_data ("
+                      "url TEXT PRIMARY KEY,"
+                      "content TEXT,"
+                      "sentiment REAL);"; // Changed sentiment to REAL
+
+    char *errmsg = 0;
+    rc = sqlite3_exec(db, sql, 0, 0, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", errmsg);
+        sqlite3_free(errmsg);
+        return 1;
+    }
+
+    return 0;
+}
+
+// Insert Data into Database
+int insert_data(const WebData *data) {
+    sqlite3_stmt *stmt;
+    const char *sql = "INSERT OR REPLACE INTO web_data (url, content, sentiment) VALUES (?, ?, ?);";
+
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+
+    sqlite3_bind_text(stmt, 1, data->url, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, data->content, -1, SQLITE_STATIC);
+    sqlite3_bind_double(stmt, 3, data->sentiment); // Bind as double
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "Execution failed: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return 1;
+    }
+
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+// Initialize Buffer
+void init_buffer(Buffer *buffer) {
+    buffer->head = 0;
+    buffer->tail = 0;
+    buffer->count = 0;
+    pthread_mutex_init(&buffer->mutex, NULL);
+    pthread_cond_init(&buffer->not_full, NULL);
+    pthread_cond_init(&buffer->not_empty, NULL);
+}
+
+// Destroy Buffer
+void destroy_buffer(Buffer *buffer) {
+    pthread_mutex_destroy(&buffer->mutex);
+    pthread_cond_destroy(&buffer->not_full);
+    pthread_cond_destroy(&buffer->not_empty);
+}
+
+// Cleanup Function (Not used in this simplified example, but good practice)
+void cleanup() {
+    // Add any cleanup code here (e.g., freeing memory, closing files)
+}
+
+
